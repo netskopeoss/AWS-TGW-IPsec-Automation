@@ -8,233 +8,235 @@ Metadata:
         default: Transit Gateway region
       TGWID:
         default: Transit Gateway identifier
-      TGWName: 
+      TGWName:
         default: Transit Gateway Name
       TGWAttachmentID1:
-        default: First (Primary) Transit Gateway VPN attachment 
+        default: First (Primary) Transit Gateway VPN attachment
       TGWAttachmentID2:
         default: Second (Failover) Transit Gateway VPN attachment
       Fallback:
         default: Is fallback required?
+      SlackIncomingWebhook:
+        default: Slack incoming webhook URL
 
 Parameters:
   TGWRegion:
-    Default: ""
     AllowedValues:
       - "us-east-1"
       - "us-east-2"
       - "us-west-1"
       - "us-west-2"
-    Description: 'The AWS region where your TGW deployed'
+    Description: "The AWS region where your TGW deployed"
     Type: String
   TGWID:
     Default: ""
-    Description: 'TGW ID. For example, tgw-01234567890123456'
+    Description: "TGW ID. For example, tgw-01234567890123456"
     Type: String
   TGWName:
     Default: ""
     Description: 'TGW name that will be used for access control. All your TGW attachments must have an attribute {"Key"="TGWName", "Value"="This parameter"}. For example, {"Key"="TGWName", "MyProdTGW-us-east-1"}'
     Type: String
   TGWAttachmentID1:
-    Default: ''
-    Description: 'TGW attachment ID for the first (primary) VPN. For example, tgw-attach-01234567890123456'
+    Default: ""
+    Description: "TGW attachment ID for the first (primary) VPN. For example, tgw-attach-01234567890123456"
     Type: String
   TGWAttachmentID2:
-    Default: 't'
-    Description: 'TGW attachment ID for the second (failover) VPN. For example, tgw-attach-01234567890123456'
+    Default: "t"
+    Description: "TGW attachment ID for the second (failover) VPN. For example, tgw-attach-01234567890123456"
     Type: String
   Fallback:
-    Default: 'yes'
-    Description: 'Yes/No parameter for the route fallback support to the TGWAttachmentID1 if both of its IPsec tunnels became active after the failure.'
+    Default: "yes"
+    Description: "Yes/No parameter for the route fallback support to the TGWAttachmentID1 if both of its IPsec tunnels became active after the failure."
     AllowedValues:
-      - 'yes'
-      - 'no'
-    Type: 'String'
-Conditions: 
+      - "yes"
+      - "no"
+    Type: "String"
+  SlackIncomingWebhook:
+    Default: ""
+    Description: "Slack incoming webhook URL for sending message to a Slack channel"
+    Type: "String"
+Conditions:
   FailbackSupported: !Equals
-      - !Ref Fallback
-      - 'yes'
+    - !Ref Fallback
+    - "yes"
 Mappings:
-      SourceCode:
-          General:
-              S3Bucket: 'yd-source-us-west-2'
-              S3Prefix: "IPsecManagement"
+  SourceCode:
+    General:
+      S3Bucket: "yd-source-us-west-2"
+      S3Prefix: "IPsecManagement"
 
 Resources:
   DynamoDBLockTable:
     Type: AWS::DynamoDB::Table
-    Properties: 
-      Tags: 
-          - Key: Type
-            Value: IPSecAutomationToNetskope
-      AttributeDefinitions: 
-        - 
-          AttributeName: "lock_key"
+    Properties:
+      Tags:
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+      AttributeDefinitions:
+        - AttributeName: "lock_key"
           AttributeType: "S"
-        - 
-          AttributeName: "sort_key"
+        - AttributeName: "sort_key"
           AttributeType: "S"
-      KeySchema: 
-        - 
-          AttributeName: "lock_key"
+      KeySchema:
+        - AttributeName: "lock_key"
           KeyType: "HASH"
-        - 
-          AttributeName: "sort_key"
+        - AttributeName: "sort_key"
           KeyType: "RANGE"
-      BillingMode: 'PAY_PER_REQUEST'
-      TimeToLiveSpecification: 
-          AttributeName: 'expiry_time'
-          Enabled: True
-
+      BillingMode: "PAY_PER_REQUEST"
+      TimeToLiveSpecification:
+        AttributeName: "expiry_time"
+        Enabled: True
 
   IPsecManagementLambdaExecutionRole:
-      DependsOn: DynamoDBLockTable
-      Type: 'AWS::IAM::Role'
-      Properties:
-        Tags: 
-          - Key: Type
-            Value: IPSecAutomationToNetskope
-        AssumeRolePolicyDocument:
-          Statement:
-            - Effect: Allow
-              Principal:
-                Service:
-                  - lambda.amazonaws.com
-              Action:
-                - sts:AssumeRole
-        Path: '/'
-        Policies:
-            - PolicyName: IPsecManagementEC2ActionsPolicy
-              PolicyDocument:
-                Statement:
-                  - Effect: Allow
-                    Action:
-                      - 'ec2:SearchTransitGatewayRoutes'
-                      - 'ec2:ReplaceTransitGatewayRoute'
-                    Resource:
-                      - 'arn:aws:ec2:*:*:transit-gateway-route-table/*'
-                      - 'arn:aws:ec2:*:*:transit-gateway-attachment/*'
-                    Condition:
-                      StringEquals:
-                        'ec2:ResourceTag/TGWName': !Ref TGWName
-                  - Effect: Allow
-                    Action:
-                      - 'ec2:DescribeTransitGatewayRouteTables'
-                      - 'ec2:DescribeVpnConnections'
-                      - 'ec2:DescribeTransitGatewayAttachments'
-                    Resource:
-                      - '*'
-            - PolicyName: IPsecManagementDynamoDBActionsPolicy
-              PolicyDocument:
-                Statement:
-                  - Effect: Allow
-                    Action:
-                      - 'dynamodb:PutItem'
-                      - 'dynamodb:GetItem'
-                      - 'dynamodb:DeleteItem'
-                      - 'dynamodb:UpdateItem'
-                    Resource:
-                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBLockTable}'
-                      - 'arn:aws:ec2:*:*:transit-gateway-attachment/*'
-            - PolicyName: LogsAccess
-              PolicyDocument:
-                Statement:
-                  - Effect: Allow
-                    Action:
-                      - 'logs:CreateLogGroup'
-                    Resource:
-                      - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
-                  - Effect: Allow
-                    Action:
-                      - 'logs:CreateLogStream'
-                      - 'logs:PutLogEvents'
-                    Resource:
-                      - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+    DependsOn: DynamoDBLockTable
+    Type: "AWS::IAM::Role"
+    Properties:
+      Tags:
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: IPsecManagementEC2ActionsPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:SearchTransitGatewayRoutes"
+                  - "ec2:ReplaceTransitGatewayRoute"
+                Resource:
+                  - "arn:aws:ec2:*:*:transit-gateway-route-table/*"
+                  - "arn:aws:ec2:*:*:transit-gateway-attachment/*"
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/TGWName": !Ref TGWName
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeTransitGatewayRouteTables"
+                  - "ec2:DescribeVpnConnections"
+                  - "ec2:DescribeTransitGatewayAttachments"
+                Resource:
+                  - "*"
+        - PolicyName: IPsecManagementDynamoDBActionsPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBLockTable}"
+                  - "arn:aws:ec2:*:*:transit-gateway-attachment/*"
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
   IPsecManagementLambda:
-      Type: 'AWS::Lambda::Function'
-      DependsOn: IPsecManagementLambdaExecutionRole
-      Properties:
-        Description: >-
-          This lambda function triggered when IPsec VPN to Netskope Security Cloud status changes and updates static routes in the TGW route tables.
-        Handler: 'lambda_function.lambda_handler'
-        Role: !GetAtt IPsecManagementLambdaExecutionRole.Arn
-        Code:
-          S3Bucket: !FindInMap ["SourceCode", "General", "S3Bucket"]
-          S3Key: !Join ['/', [!FindInMap ["SourceCode", "General", "S3Prefix"], 'IPsecManagementLambda.zip']]
-        Environment:
-          Variables:
-            TGWID: !Ref TGWID
-            TGWRegion: !Ref TGWRegion
-            TGWAttachmentID1: !Ref TGWAttachmentID1
-            TGWAttachmentID2: !Ref TGWAttachmentID2
-            DynamoDBLockTable: !Ref DynamoDBLockTable
-            FallbackSupport: !Ref Fallback
-            LOGLEVEL: 'INFO'
-        Runtime: python3.8
-        MemorySize: 128
-        Timeout: 300
-        Tags: 
-          - Key: Type
-            Value: IPSecAutomationToNetskope
-  EventRule: 
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: >-
+        This lambda function triggered when IPsec VPN to Netskope Security Cloud status changes and updates static routes in the TGW route tables.
+      Handler: "lambda_function.lambda_handler"
+      Role: !GetAtt IPsecManagementLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !FindInMap ["SourceCode", "General", "S3Bucket"]
+        S3Key:
+          !Join [
+            "/",
+            [
+              !FindInMap ["SourceCode", "General", "S3Prefix"],
+              "IPsecManagementLambda.zip",
+            ],
+          ]
+      Environment:
+        Variables:
+          TGWID: !Ref TGWID
+          TGWRegion: !Ref TGWRegion
+          TGWAttachmentID1: !Ref TGWAttachmentID1
+          TGWAttachmentID2: !Ref TGWAttachmentID2
+          DynamoDBLockTable: !Ref DynamoDBLockTable
+          FallbackSupport: !Ref Fallback
+          SlackIncomingWebhook: !Ref SlackIncomingWebhook
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 300
+      Tags:
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+  EventRule:
     Type: AWS::Events::Rule
-    DependsOn: IPsecManagementLambda
-    Properties: 
+    Properties:
       Description: "Event Rule for IPsecManagement Lambda function updating static routes to Netskope"
-      EventPattern: 
-        source: 
+      EventPattern:
+        source:
           - "aws.networkmanager"
-        detail-type: 
+        detail-type:
           - "Network Manager Status Update"
-        detail: 
-          transitGatewayArn: 
+        detail:
+          transitGatewayArn:
             - !Sub "arn:aws:ec2:${TGWRegion}:${AWS::AccountId}:transit-gateway/${TGWID}"
       State: "ENABLED"
-      Targets: 
-        - 
-          Arn: 
-            Fn::GetAtt: 
+      Targets:
+        - Arn:
+            Fn::GetAtt:
               - "IPsecManagementLambda"
               - "Arn"
           Id: "IPsecManagementLambda"
-  PermissionForEventsToInvokeLambda: 
+  PermissionForEventsToInvokeLambda:
     Type: AWS::Lambda::Permission
-    Properties: 
-      FunctionName: 
+    Properties:
+      FunctionName:
         Ref: "IPsecManagementLambda"
       Action: "lambda:InvokeFunction"
       Principal: "events.amazonaws.com"
-      SourceArn: 
-        Fn::GetAtt: 
+      SourceArn:
+        Fn::GetAtt:
           - "EventRule"
           - "Arn"
-  EventRuleScheduled: 
+  EventRuleScheduled:
     Type: AWS::Events::Rule
     Condition: FailbackSupported
-    DependsOn: IPsecManagementLambda
-    Properties: 
+    Properties:
       Description: "Scheduled event Rule for IPsecManagement Lambda function updating static routes to Netskope"
       ScheduleExpression: "rate(10 minutes)"
       State: "ENABLED"
-      Targets: 
-        - 
-          Arn: 
-            Fn::GetAtt: 
+      Targets:
+        - Arn:
+            Fn::GetAtt:
               - "IPsecManagementLambda"
               - "Arn"
           Id: "IPsecManagementLambda"
           Input: !Sub '{"detail": {"changeType": "VPN-CONNECTION-IPSEC-HEALTHCHECK","transitGatewayArn": "arn:aws:ec2:${TGWRegion}:${AWS::AccountId}:transit-gateway/${TGWID}"}}'
 
-  PermissionForEventsToInvokeScheduledLambda: 
+  PermissionForEventsToInvokeScheduledLambda:
     Type: AWS::Lambda::Permission
     Condition: FailbackSupported
-    Properties: 
-      FunctionName: 
+    Properties:
+      FunctionName:
         Ref: "IPsecManagementLambda"
       Action: "lambda:InvokeFunction"
       Principal: "events.amazonaws.com"
-      SourceArn: 
-        Fn::GetAtt: 
+      SourceArn:
+        Fn::GetAtt:
           - "EventRuleScheduled"
           - "Arn"
 
@@ -248,4 +250,3 @@ Outputs:
   IPsecManagementLambda:
     Description: Lambda Execution Role
     Value: !GetAtt IPsecManagementLambda.Arn
-  
