@@ -18,7 +18,7 @@ tgw_attachment_id_1 = os.environ["TGWAttachmentID1"]
 tgw_attachment_id_2 = os.environ["TGWAttachmentID2"]
 dynamodb_lock_table = os.environ["DynamoDBLockTable"]
 fallback_support = os.environ["FallbackSupport"]
-slack_incoming_webhook = os.environ.get("SlackIncomingWebhook")
+slack_incoming_webhook = os.environ["SlackIncomingWebhook"]
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
