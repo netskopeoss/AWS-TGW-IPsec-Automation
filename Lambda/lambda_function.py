@@ -41,7 +41,7 @@ def send_slack_notification(message):
 
 
 def update_static_route(
-    target_tgw_id, tgw_attachment_id_current, tgw_attachment_id_new
+    message, target_tgw_id, tgw_attachment_id_current, tgw_attachment_id_new
 ):
     """Update static route to use another vpn tgw attachment"""
     lock_client = DynamoDBLockClient(
@@ -133,9 +133,9 @@ def update_static_route(
 
             for j in range(len(search_transit_gateway_routes_response["Routes"])):
                 record = search_transit_gateway_routes_response["Routes"][j]
-                logger.info(
-                    f'Replacing route {record["DestinationCidrBlock"]} to {tgw_attachment_id_new} in TGW route table '
-                    f'{describe_transit_gateway_route_tables_response["TransitGatewayRouteTables"][i]["TransitGatewayRouteTableId"]}'
+                message += (
+                    f' Replacing route {record["DestinationCidrBlock"]} to {tgw_attachment_id_new} in TGW route table '
+                    f'{describe_transit_gateway_route_tables_response["TransitGatewayRouteTables"][i]["TransitGatewayRouteTableId"]}.'
                 )
                 replace_transit_gateway_route_response = ec2.replace_transit_gateway_route(
                     DestinationCidrBlock=record["DestinationCidrBlock"],
@@ -149,6 +149,10 @@ def update_static_route(
                     TransitGatewayAttachmentId=tgw_attachment_id_new,
                 )
                 logger.info(replace_transit_gateway_route_response)
+
+            logger.warning(message)
+            if slack_incoming_webhook:
+                send_slack_notification(message)
     except botocore.exceptions.ClientError as err:
         lock.release()
         lock_client.close()
@@ -216,11 +220,9 @@ def lambda_handler(event, context):
         warning_message = (
             f"Both tunnels for {vpn_connection_id} are UP, kick off fallback."
         )
-        logger.warning(warning_message)
-        if slack_incoming_webhook:
-            send_slack_notification(warning_message)
 
         update_static_route(
+            warning_message,
             tgw_id,
             tgw_attachment_id_2
             if event_tgw_attachment_id == tgw_attachment_id_1
@@ -255,13 +257,11 @@ def lambda_handler(event, context):
             sys.exit(0)
 
         warning_message = (
-            f"Both tunnels for {vpn_connection_id} are down, kick off failover."
+            f"Both tunnels for {vpn_connection_id} are DOWN, kick off failover."
         )
-        logger.warning(warning_message)
-        if slack_incoming_webhook:
-            send_slack_notification(warning_message)
 
         update_static_route(
+            warning_message,
             tgw_id,
             event_tgw_attachment_id,
             tgw_attachment_id_2
@@ -314,14 +314,15 @@ def lambda_handler(event, context):
                 )
                 continue
 
-            warning_message = f"Health checking - Both connection for {resource_id} are down, updating route table."
-            logger.warning(warning_message)
-            if slack_incoming_webhook:
-                send_slack_notification(warning_message)
+            warning_message = f"Health checking - Both connection for {resource_id} are DOWN, updating route table."
 
             if i == 0:
-                update_static_route(tgw_id, tgw_attachment_id_1, tgw_attachment_id_2)
+                update_static_route(
+                    warning_message, tgw_id, tgw_attachment_id_1, tgw_attachment_id_2
+                )
             else:
-                update_static_route(tgw_id, tgw_attachment_id_2, tgw_attachment_id_1)
+                update_static_route(
+                    warning_message, tgw_id, tgw_attachment_id_2, tgw_attachment_id_1
+                )
 
             sys.exit(0)
