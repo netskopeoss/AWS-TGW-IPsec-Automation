@@ -151,7 +151,7 @@ def update_static_route(
                 logger.info(replace_transit_gateway_route_response)
 
             logger.warning(message)
-            if slack_incoming_webhook:
+            if slack_incoming_webhook and "Replacing route" in message:
                 send_slack_notification(message)
     except botocore.exceptions.ClientError as err:
         lock.release()
