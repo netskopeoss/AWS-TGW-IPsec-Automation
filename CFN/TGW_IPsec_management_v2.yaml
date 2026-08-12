@@ -1,0 +1,302 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "IPsec Management Lambda 2.0 — Failover automation for AWS TGW to Netskope IPsec tunnels"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Transit Gateway Configuration"
+        Parameters:
+          - TGWRegion
+          - TGWID
+          - TGWName
+          - TGWAttachmentID1
+          - TGWAttachmentID2
+          - Fallback
+      - Label:
+          default: "Lambda Deployment"
+        Parameters:
+          - LambdaS3Bucket
+          - LambdaS3Key
+    ParameterLabels:
+      TGWRegion:
+        default: "Transit Gateway Region"
+      TGWID:
+        default: "Transit Gateway ID"
+      TGWName:
+        default: "Transit Gateway Name (used for IAM tag-based access control)"
+      TGWAttachmentID1:
+        default: "Primary TGW VPN Attachment ID"
+      TGWAttachmentID2:
+        default: "Failover TGW VPN Attachment ID"
+      Fallback:
+        default: "Enable Fallback to Primary?"
+      LambdaS3Bucket:
+        default: "S3 Bucket containing the Lambda deployment package"
+      LambdaS3Key:
+        default: "S3 Key for IPsecManagementLambda.zip"
+
+Parameters:
+  TGWRegion:
+    Type: String
+    Description: "AWS region where the Transit Gateway is deployed."
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+
+  TGWID:
+    Type: String
+    Description: "Transit Gateway ID. Example: tgw-01234567890123456"
+    AllowedPattern: "^tgw-[0-9a-f]{17}$"
+    ConstraintDescription: "Must be a valid TGW ID in the format tgw-<17 hex chars>."
+
+  TGWName:
+    Type: String
+    Description: >-
+      Transit Gateway name used for IAM tag-based access control. All TGW attachments
+      must be tagged with Key=TGWName, Value=<this value>. Example: MyProdTGW-us-east-1
+    MinLength: 1
+
+  TGWAttachmentID1:
+    Type: String
+    Description: "Primary TGW VPN attachment ID. Example: tgw-attach-01234567890123456"
+    AllowedPattern: "^tgw-attach-[0-9a-f]{17}$"
+    ConstraintDescription: "Must be a valid TGW attachment ID in the format tgw-attach-<17 hex chars>."
+
+  TGWAttachmentID2:
+    Type: String
+    Description: "Failover TGW VPN attachment ID. Example: tgw-attach-01234567890123456"
+    AllowedPattern: "^tgw-attach-[0-9a-f]{17}$"
+    ConstraintDescription: "Must be a valid TGW attachment ID in the format tgw-attach-<17 hex chars>."
+
+  Fallback:
+    Type: String
+    Default: "yes"
+    Description: >-
+      When enabled, the Lambda will revert static routes back to the primary attachment
+      (TGWAttachmentID1) once both of its IPsec tunnels are active again.
+    AllowedValues:
+      - "yes"
+      - "no"
+
+  LambdaS3Bucket:
+    Type: String
+    Description: "Name of the S3 bucket that holds the Lambda deployment package."
+    MinLength: 3
+
+  LambdaS3Key:
+    Type: String
+    Description: "S3 object key for the Lambda zip. Example: IPsecManagement/IPsecManagementLambda_v2.zip"
+    Default: "IPsecManagement/IPsecManagementLambda_v2.zip"
+
+Conditions:
+  FailbackSupported: !Equals [!Ref Fallback, "yes"]
+
+Resources:
+
+  # ── DynamoDB distributed lock table ────────────────────────────────────────
+  DynamoDBLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-LockTable"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: lock_key
+          AttributeType: S
+        - AttributeName: sort_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: lock_key
+          KeyType: HASH
+        - AttributeName: sort_key
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiry_time
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-LockTable"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Lambda execution role ───────────────────────────────────────────────────
+  IPsecManagementLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-LambdaRole"
+      Description: "Execution role for the IPsec failover Lambda - least-privilege access to TGW route tables and DynamoDB lock table."
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IPsecManagementEC2ActionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:SearchTransitGatewayRoutes
+                  - ec2:ReplaceTransitGatewayRoute
+                Resource:
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:transit-gateway-route-table/*"
+                  - !Sub "arn:aws:ec2:*:${AWS::AccountId}:transit-gateway-attachment/*"
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/TGWName": !Ref TGWName
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTransitGatewayRouteTables
+                  - ec2:DescribeVpnConnections
+                  - ec2:DescribeTransitGatewayAttachments
+                Resource: "*"
+        - PolicyName: IPsecManagementDynamoDBActionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt DynamoDBLockTable.Arn
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-LambdaRole"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Failover Lambda function ────────────────────────────────────────────────
+  IPsecManagementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-FailoverLambda"
+      Description: >-
+        Triggered by AWS Network Manager IPsec tunnel state changes. Checks whether
+        both tunnels on a VPN connection are down and, if so, updates TGW static routes
+        to fail over to the alternate Netskope POP attachment.
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IPsecManagementLambdaExecutionRole.Arn
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          TGWID: !Ref TGWID
+          TGWRegion: !Ref TGWRegion
+          TGWAttachmentID1: !Ref TGWAttachmentID1
+          TGWAttachmentID2: !Ref TGWAttachmentID2
+          DynamoDBLockTable: !Ref DynamoDBLockTable
+          FallbackSupport: !Ref Fallback
+          LOGLEVEL: INFO
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-FailoverLambda"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── EventBridge rule — real-time tunnel state changes ──────────────────────
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-TunnelStateRule"
+      Description: "Triggers the IPsec failover Lambda on Network Manager VPN tunnel state changes."
+      EventPattern:
+        source:
+          - aws.networkmanager
+        detail-type:
+          - "Network Manager Status Update"
+        detail:
+          transitGatewayArn:
+            - !Sub "arn:aws:ec2:${TGWRegion}:${AWS::AccountId}:transit-gateway/${TGWID}"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IPsecManagementLambda.Arn
+          Id: IPsecManagementLambda
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IPsecManagementLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRule.Arn
+
+  # ── EventBridge rule — periodic health check (fallback mode only) ──────────
+  EventRuleScheduled:
+    Type: AWS::Events::Rule
+    Condition: FailbackSupported
+    Properties:
+      Name: !Sub "${AWS::StackName}-HealthCheckRule"
+      Description: "Runs a periodic tunnel health check every 10 minutes to catch missed state-change events."
+      ScheduleExpression: "rate(10 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IPsecManagementLambda.Arn
+          Id: IPsecManagementLambda
+          Input: !Sub |
+            {"detail": {"changeType": "VPN-CONNECTION-IPSEC-HEALTHCHECK", "transitGatewayArn": "arn:aws:ec2:${TGWRegion}:${AWS::AccountId}:transit-gateway/${TGWID}"}}
+
+  PermissionForEventsToInvokeScheduledLambda:
+    Type: AWS::Lambda::Permission
+    Condition: FailbackSupported
+    Properties:
+      FunctionName: !Ref IPsecManagementLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRuleScheduled.Arn
+
+Outputs:
+  DynamoDBLockTable:
+    Description: "ARN of the DynamoDB distributed lock table."
+    Value: !GetAtt DynamoDBLockTable.Arn
+
+  IPsecManagementLambdaExecutionRole:
+    Description: "ARN of the Lambda execution role."
+    Value: !GetAtt IPsecManagementLambdaExecutionRole.Arn
+
+  IPsecManagementLambda:
+    Description: "ARN of the failover Lambda function."
+    Value: !GetAtt IPsecManagementLambda.Arn
