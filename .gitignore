@@ -1,0 +1,23 @@
+# Local planning docs
+PLAN.md
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+Lambda/IPsecManagementLambda.zip
+Lambda/IPsecManagementLambda_v2.zip
+Lambda/IPsecProvisioningLambda.zip
+demo/Lambda/IPsecProvisioningLambda.zip
+
+# Reference documents (not part of the solution)
+*.pdf
+netskope_aws_reference_architecture_1.*

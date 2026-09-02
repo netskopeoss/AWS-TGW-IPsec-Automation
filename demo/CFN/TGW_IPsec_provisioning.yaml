@@ -1,0 +1,489 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  IPsec Provisioning 2.0 — Creates four Netskope IPsec tunnel sites via the
+  Netskope API and the corresponding AWS Site-to-Site VPN connections attached
+  to a Transit Gateway. Following the official Netskope AWS guide, four sites
+  are required: one per AWS VPN tunnel endpoint (two VPN connections × two AZ
+  tunnels each). The Netskope API token and IPsec pre-shared key are accepted
+  as confidential parameters and stored in Secrets Manager. AWS VPN tunnel
+  outside IPs are discovered automatically and written back to each Netskope
+  site as srcidentity. Outputs the TGW attachment IDs required by the IPsec
+  Management (failover) stack.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Transit Gateway Configuration"
+        Parameters:
+          - TGWID
+          - TGWName
+      - Label:
+          default: "Netskope Configuration"
+        Parameters:
+          - NetskopeHostname
+          - NetskopeApiToken
+          - SiteName
+          - PrimaryPOP
+          - FailoverPOP
+      - Label:
+          default: "Tunnel Options"
+        Parameters:
+          - PreSharedKey
+          - Bandwidth
+          - Encryption
+          - BGPAsn
+      - Label:
+          default: "Lambda Deployment"
+        Parameters:
+          - LambdaS3Bucket
+          - LambdaS3Key
+    ParameterLabels:
+      TGWID:
+        default: "Transit Gateway ID"
+      TGWName:
+        default: "Transit Gateway Name (used for resource tagging)"
+      NetskopeHostname:
+        default: "Netskope Tenant Hostname"
+      NetskopeApiToken:
+        default: "Netskope API Token (stored in Secrets Manager)"
+      SiteName:
+        default: "IPsec Site Base Name"
+      PrimaryPOP:
+        default: "Primary Netskope POP"
+      FailoverPOP:
+        default: "Failover Netskope POP"
+      PreSharedKey:
+        default: "IPsec Pre-Shared Key (stored in Secrets Manager)"
+      Bandwidth:
+        default: "Tunnel Bandwidth (Mbps)"
+      Encryption:
+        default: "IPsec Encryption Algorithm"
+      BGPAsn:
+        default: "Customer Gateway BGP ASN"
+      LambdaS3Bucket:
+        default: "S3 Bucket containing the Lambda deployment package"
+      LambdaS3Key:
+        default: "S3 Key for IPsecProvisioningLambda.zip"
+
+Parameters:
+
+  TGWID:
+    Type: String
+    Description: "Transit Gateway ID. Example: tgw-01234567890123456"
+    AllowedPattern: "^tgw-[0-9a-f]{17}$"
+    ConstraintDescription: "Must be in the format tgw-<17 hex chars>."
+
+  TGWName:
+    Type: String
+    Description: >-
+      Transit Gateway name used for resource tagging. All TGW attachments and
+      route tables must be tagged with Key=TGWName, Value=<this value> for the
+      failover stack IAM policy to permit route updates.
+    MinLength: 1
+
+  NetskopeHostname:
+    Type: String
+    Description: "Netskope tenant hostname (e.g. mytenant.goskope.com). Do not include https://."
+    MinLength: 1
+
+  NetskopeApiToken:
+    Type: String
+    NoEcho: true
+    Description: >-
+      Netskope REST API token for IPsec site management. This value is stored in
+      AWS Secrets Manager by this stack and is never visible after submission.
+      Generate a token in the Netskope UI at Settings → Tools → REST API.
+    MinLength: 1
+
+  SiteName:
+    Type: String
+    Description: >-
+      Base name for the four Netskope IPsec tunnel sites. Suffixes
+      '-{pop}-a' and '-{pop}-b' are appended automatically.
+      Example: aws-tgw-us-east-1
+    MinLength: 1
+
+  PrimaryPOP:
+    Type: String
+    Description: >-
+      Primary Netskope POP identifier (e.g. iad2). This POP becomes the first
+      (active) gateway for VPN Connection 1 tunnels.
+      Use the Netskope UI (Settings → Security Cloud Platform → IPSec) or the
+      list_ipsec_pops API to find valid identifiers.
+    MinLength: 1
+
+  FailoverPOP:
+    Type: String
+    Description: >-
+      Failover Netskope POP identifier (e.g. bos1). This POP becomes the active
+      gateway for VPN Connection 2 tunnels and the backup for VPN Connection 1.
+    MinLength: 1
+
+  PreSharedKey:
+    Type: String
+    NoEcho: true
+    Description: >-
+      IPsec pre-shared key used by all four AWS VPN tunnel endpoints and all four
+      Netskope tunnel sites. This value is stored in AWS Secrets Manager by
+      this stack. Requirements: 8–64 characters, alphanumeric characters,
+      periods (.), and underscores (_) only — must not begin with zero (0).
+    MinLength: 8
+    MaxLength: 64
+
+  Bandwidth:
+    Type: Number
+    Description: "Tunnel bandwidth in Mbps allocated on the Netskope side."
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+
+  Encryption:
+    Type: String
+    Description: "IPsec encryption algorithm configured on the Netskope side."
+    Default: AES256-CBC
+    AllowedValues:
+      - AES128-CBC
+      - AES256-CBC
+      - AES128-GCM
+      - AES256-GCM
+
+  BGPAsn:
+    Type: Number
+    Description: >-
+      BGP Autonomous System Number assigned to both AWS Customer Gateways.
+      Required by the EC2 API even when static routing is used. Use a private
+      ASN in the range 64512–65534 unless you have a public ASN assigned.
+    Default: 65000
+    MinValue: 1
+    MaxValue: 4294967294
+
+  LambdaS3Bucket:
+    Type: String
+    Description: "Name of the S3 bucket that holds the Lambda deployment package."
+    MinLength: 3
+
+  LambdaS3Key:
+    Type: String
+    Description: >-
+      S3 object key for the provisioning Lambda zip.
+      Example: IPsecManagement/IPsecProvisioningLambda.zip
+    Default: "IPsecManagement/IPsecProvisioningLambda.zip"
+
+Resources:
+
+  # ── Secrets Manager secrets ────────────────────────────────────────────────
+  #
+  # Both secrets are created by this stack from the NoEcho parameters above.
+  # Their ARNs are passed to the provisioning Lambda and the VPN connection
+  # resources; the plaintext values are never exposed after stack creation.
+
+  NetskopeApiTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-netskope-api-token"
+      Description: "Netskope REST API token for the IPsec provisioning Lambda."
+      SecretString: !Ref NetskopeApiToken
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-netskope-api-token"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  IPsecPskSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-ipsec-psk"
+      Description: "IPsec pre-shared key for the Netskope tunnel sites and AWS VPN connections."
+      SecretString: !Ref PreSharedKey
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ipsec-psk"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── IAM role for the provisioning Lambda ───────────────────────────────────
+  NetskopeProvisionerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ProvisionerRole"
+      Description: >-
+        Execution role for the Netskope IPsec provisioning Custom Resource Lambda.
+        Grants read access to the stack-owned Secrets Manager secrets and EC2
+        describe access for TGW attachment and VPN outside IP lookup.
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref NetskopeApiTokenSecret
+                  - !Ref IPsecPskSecret
+        - PolicyName: EC2DescribeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTransitGatewayAttachments
+                  - ec2:DescribeVpnConnections
+                Resource: "*"
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ProvisionerRole"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Provisioning Lambda ────────────────────────────────────────────────────
+  NetskopeProvisionerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ProvisionerLambda"
+      Description: >-
+        CloudFormation Custom Resource handler. Creates/deletes Netskope IPsec
+        tunnel sites via the Netskope REST API and polls EC2 to resolve TGW
+        attachment IDs and VPN outside IPs for newly created VPN connections.
+      Handler: provisioning_function.lambda_handler
+      Role: !GetAtt NetskopeProvisionerLambdaRole.Arn
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ProvisionerLambda"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Custom Resource — Netskope IPsec tunnel provisioning ──────────────────
+  #
+  # Creates four Netskope sites with placeholder srcidentity values.
+  # Site naming: {SiteName}-{pop}-a / {SiteName}-{pop}-b
+  #   VPN1 sites (-{primary_pop}-a/-b): primary_pop first, failover_pop backup
+  #   VPN2 sites (-{failover_pop}-a/-b): failover_pop first, primary_pop backup
+  NetskopeIPsecSites:
+    Type: Custom::NetskopeIPsecSites
+    Properties:
+      ServiceToken: !GetAtt NetskopeProvisionerLambda.Arn
+      NetskopeHostname: !Ref NetskopeHostname
+      NetskopeTokenSecretArn: !Ref NetskopeApiTokenSecret
+      SiteName: !Ref SiteName
+      PrimaryPOP: !Ref PrimaryPOP
+      FailoverPOP: !Ref FailoverPOP
+      PskSecretArn: !Ref IPsecPskSecret
+      Bandwidth: !Ref Bandwidth
+      Encryption: !Ref Encryption
+
+  # ── Customer Gateways — IPs provided by the Netskope API ──────────────────
+  CustomerGateway1:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: !Ref BGPAsn
+      IpAddress: !GetAtt NetskopeIPsecSites.PrimaryGatewayIP
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Primary-CG"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: TGWName
+          Value: !Ref TGWName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  CustomerGateway2:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: !Ref BGPAsn
+      IpAddress: !GetAtt NetskopeIPsecSites.FailoverGatewayIP
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Failover-CG"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: TGWName
+          Value: !Ref TGWName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Site-to-Site VPN connections attached to the Transit Gateway ───────────
+  #
+  # Both tunnels per connection use the same PSK (resolved from Secrets Manager
+  # at deploy time). DPDTimeoutAction=restart and StartupAction=start are
+  # required per the Netskope AWS integration guide so that AWS actively
+  # initiates IKE and re-establishes the tunnel after DPD timeout.
+  VPNConnection1:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref CustomerGateway1
+      TransitGatewayId: !Ref TGWID
+      StaticRoutesOnly: true
+      VpnTunnelOptionsSpecifications:
+        - PreSharedKey: !Sub "{{resolve:secretsmanager:${IPsecPskSecret}}}"
+          DpdTimeoutAction: restart
+          StartupAction: start
+        - PreSharedKey: !Sub "{{resolve:secretsmanager:${IPsecPskSecret}}}"
+          DpdTimeoutAction: restart
+          StartupAction: start
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Primary-VPN"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: TGWName
+          Value: !Ref TGWName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  VPNConnection2:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref CustomerGateway2
+      TransitGatewayId: !Ref TGWID
+      StaticRoutesOnly: true
+      VpnTunnelOptionsSpecifications:
+        - PreSharedKey: !Sub "{{resolve:secretsmanager:${IPsecPskSecret}}}"
+          DpdTimeoutAction: restart
+          StartupAction: start
+        - PreSharedKey: !Sub "{{resolve:secretsmanager:${IPsecPskSecret}}}"
+          DpdTimeoutAction: restart
+          StartupAction: start
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Failover-VPN"
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: TGWName
+          Value: !Ref TGWName
+        - Key: Type
+          Value: IPSecAutomationToNetskope
+
+  # ── Custom Resource — resolve TGW attachment IDs for the VPN connections ───
+  TGWAttachmentLookup:
+    Type: Custom::TGWAttachmentLookup
+    Properties:
+      ServiceToken: !GetAtt NetskopeProvisionerLambda.Arn
+      Mode: Lookup
+      VPNConnectionID1: !Ref VPNConnection1
+      VPNConnectionID2: !Ref VPNConnection2
+
+  # ── Custom Resource — update Netskope tunnel srcidentity with VPN outside IPs
+  #
+  # Each AWS VPN connection has two tunnel endpoints in different AZs, each
+  # with its own outside IP. This resource patches all four Netskope sites
+  # with their corresponding VGW outside IP as both srcidentity and
+  # srcipidentity so IKE negotiation succeeds. The PATCH includes the full
+  # tunnel config to preserve encryption and other settings.
+  NetskopeUpdateSrcIdentity:
+    Type: Custom::NetskopeUpdateSrcIdentity
+    DependsOn: TGWAttachmentLookup
+    Properties:
+      ServiceToken: !GetAtt NetskopeProvisionerLambda.Arn
+      Mode: UpdateSrcIdentity
+      NetskopeHostname: !Ref NetskopeHostname
+      NetskopeTokenSecretArn: !Ref NetskopeApiTokenSecret
+      PskSecretArn: !Ref IPsecPskSecret
+      VPNConnectionID1: !Ref VPNConnection1
+      VPNConnectionID2: !Ref VPNConnection2
+      Site1aId: !GetAtt NetskopeIPsecSites.Site1aId
+      Site1bId: !GetAtt NetskopeIPsecSites.Site1bId
+      Site2aId: !GetAtt NetskopeIPsecSites.Site2aId
+      Site2bId: !GetAtt NetskopeIPsecSites.Site2bId
+
+Outputs:
+
+  TGWAttachmentID1:
+    Description: >-
+      TGW VPN attachment for VPN Connection 1 (primary POP). Use as
+      TGWAttachmentID1 when deploying the IPsec Management (failover) stack.
+    Value: !GetAtt TGWAttachmentLookup.AttachmentID1
+
+  TGWAttachmentID2:
+    Description: >-
+      TGW VPN attachment for VPN Connection 2 (failover POP). Use as
+      TGWAttachmentID2 when deploying the IPsec Management (failover) stack.
+    Value: !GetAtt TGWAttachmentLookup.AttachmentID2
+
+  VPNConnectionID1:
+    Description: "AWS Site-to-Site VPN Connection ID for the primary POP connection."
+    Value: !Ref VPNConnection1
+
+  VPNConnectionID2:
+    Description: "AWS Site-to-Site VPN Connection ID for the failover POP connection."
+    Value: !Ref VPNConnection2
+
+  NetskopeSite1aId:
+    Description: "Netskope IPsec site ID for VPN1 Tunnel 1. Retain for support purposes."
+    Value: !GetAtt NetskopeIPsecSites.Site1aId
+
+  NetskopeSite1bId:
+    Description: "Netskope IPsec site ID for VPN1 Tunnel 2. Retain for support purposes."
+    Value: !GetAtt NetskopeIPsecSites.Site1bId
+
+  NetskopeSite2aId:
+    Description: "Netskope IPsec site ID for VPN2 Tunnel 1. Retain for support purposes."
+    Value: !GetAtt NetskopeIPsecSites.Site2aId
+
+  NetskopeSite2bId:
+    Description: "Netskope IPsec site ID for VPN2 Tunnel 2. Retain for support purposes."
+    Value: !GetAtt NetskopeIPsecSites.Site2bId
+
+  VPN1Tunnel1OutsideIP:
+    Description: "VGW outside IP for VPN Connection 1 Tunnel 1 (set as srcidentity on site 1a)."
+    Value: !GetAtt NetskopeUpdateSrcIdentity.Site1aSrcIdentity
+
+  VPN1Tunnel2OutsideIP:
+    Description: "VGW outside IP for VPN Connection 1 Tunnel 2 (set as srcidentity on site 1b)."
+    Value: !GetAtt NetskopeUpdateSrcIdentity.Site1bSrcIdentity
+
+  VPN2Tunnel1OutsideIP:
+    Description: "VGW outside IP for VPN Connection 2 Tunnel 1 (set as srcidentity on site 2a)."
+    Value: !GetAtt NetskopeUpdateSrcIdentity.Site2aSrcIdentity
+
+  VPN2Tunnel2OutsideIP:
+    Description: "VGW outside IP for VPN Connection 2 Tunnel 2 (set as srcidentity on site 2b)."
+    Value: !GetAtt NetskopeUpdateSrcIdentity.Site2bSrcIdentity
+
+  NetskopeApiTokenSecretArn:
+    Description: "ARN of the Secrets Manager secret holding the Netskope API token."
+    Value: !Ref NetskopeApiTokenSecret
+
+  IPsecPskSecretArn:
+    Description: "ARN of the Secrets Manager secret holding the IPsec pre-shared key."
+    Value: !Ref IPsecPskSecret
